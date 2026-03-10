@@ -29,9 +29,11 @@ def _parse_time_minutes(slot: str) -> int:
     return dt.hour * 60 + dt.minute
 
 
-def _day_of_week(date_str: str) -> str:
-    """Return full weekday name (e.g. 'Monday') for an ISO date string."""
-    return datetime.strptime(date_str, "%Y-%m-%d").strftime("%A")
+def _day_of_week(date_str: str) -> int:
+    """Return JS-style day-of-week integer for an ISO date string (Sun=0 … Sat=6)."""
+    # Python isoweekday: Mon=1…Sun=7  →  JS getDay: Sun=0…Sat=6
+    py_dow = datetime.strptime(date_str, "%Y-%m-%d").isoweekday()  # Mon=1…Sun=7
+    return py_dow % 7  # Sun=0, Mon=1 … Sat=6
 
 
 def _parse_state(address: str) -> str | None:
@@ -61,7 +63,7 @@ def _eligible(
     inspector: Inspector,
     job: Job,
     settings: Settings,
-    request_day: str,
+    request_day: int,
     inspector_state: str | None,
     job_state: str | None,
 ) -> bool:
@@ -91,7 +93,9 @@ def _eligible(
     # schedule blocks
     job_minutes = _parse_time_minutes(job.time_slot)
     for block in inspector.schedule_blocks:
-        if block.day.lower() == request_day.lower():
+        if block.day == request_day:
+            if block.slot == "*":  # whole-day block
+                return False
             block_minutes = _parse_time_minutes(block.slot)
             if block_minutes == job_minutes:
                 return False

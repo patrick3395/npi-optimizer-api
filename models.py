@@ -6,8 +6,8 @@ from pydantic import BaseModel, Field
 
 
 class ScheduleBlock(BaseModel):
-    day: str
-    slot: str
+    day: int  # 0=Sun, 1=Mon … 6=Sat
+    slot: str  # "8:30 AM" or "*" for whole-day block
 
 
 class LatLng(BaseModel):
