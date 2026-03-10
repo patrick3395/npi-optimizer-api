@@ -1,8 +1,24 @@
-"""OR-Tools VRPTW optimizer for NPI Route Optimizer."""
+"""OR-Tools VRPTW optimizer for NPI Route Optimizer.
+
+Constraints implemented (mirrors app/lib/optimizer.ts exactly):
+  1. Capabilities          — required_capabilities ⊆ inspector.capabilities
+  2. Distance limit        — haversine(home, job) ≤ max_home_dist_km
+  3. Max jobs capacity     — inspector.max_jobs (soft: 2 base, hard: 3)
+  4. 3rd-job time rule     — only 2 jobs before third_job_min_time per inspector
+  5. Same-slot uniqueness  — VehicleVar(a) != VehicleVar(b) for same time_slot
+  6. Weekly schedule       — schedule_blocks by day + slot (or whole-day "*")
+  7. Exclusion zones       — ray-cast point-in-polygon per inspector
+  8. Property rules        — maxSqFt / minYearBuilt / maxYearBuilt per inspector
+  9. Run rules (block)     — job.blocked_inspectors list → RemoveValue
+ 10. Locked inspector      — job.locked_inspector → VehicleVar.SetValue
+ 11. State filtering       — inspector.home_state vs job state from address
+ 12. Ranking preference    — per-vehicle arc cost penalty for lower-rank inspectors
+"""
 
 from __future__ import annotations
 
 import re
+from collections import defaultdict
 from datetime import datetime
 from typing import Sequence
 
@@ -18,22 +34,28 @@ from models import (
     Settings,
 )
 
-# ---------- helpers ----------------------------------------------------------
+# ---------- constants --------------------------------------------------------
 
 _TIME_FMT_12 = "%I:%M %p"
+_TIME_BUFFER_MIN = 30   # ± buffer around appointment slot for time dimension
+_SERVICE_TIME_MIN = 60  # assumed on-site service duration (minutes)
+
+# ---------- helpers ----------------------------------------------------------
 
 
 def _parse_time_minutes(slot: str) -> int:
-    """Parse '9:00 AM' style string to minutes since midnight."""
-    dt = datetime.strptime(slot.strip(), _TIME_FMT_12)
-    return dt.hour * 60 + dt.minute
+    """Parse '9:00 AM' / '1:30 PM' → minutes since midnight."""
+    try:
+        dt = datetime.strptime(slot.strip(), _TIME_FMT_12)
+        return dt.hour * 60 + dt.minute
+    except ValueError:
+        return 0
 
 
 def _day_of_week(date_str: str) -> int:
-    """Return JS-style day-of-week integer for an ISO date string (Sun=0 … Sat=6)."""
-    # Python isoweekday: Mon=1…Sun=7  →  JS getDay: Sun=0…Sat=6
+    """Return JS-style day-of-week integer (Sun=0 … Sat=6) for an ISO date."""
     py_dow = datetime.strptime(date_str, "%Y-%m-%d").isoweekday()  # Mon=1…Sun=7
-    return py_dow % 7  # Sun=0, Mon=1 … Sat=6
+    return py_dow % 7
 
 
 def _parse_state(address: str) -> str | None:
@@ -42,21 +64,21 @@ def _parse_state(address: str) -> str | None:
     return m.group(1) if m else None
 
 
-def _point_in_polygon(lat: float, lng: float, polygon: Sequence[dict]) -> bool:
-    """Ray-casting point-in-polygon test."""
+def _point_in_polygon(lat: float, lng: float, polygon: Sequence) -> bool:
+    """Ray-casting point-in-polygon. polygon items are LatLng objects."""
     n = len(polygon)
     inside = False
     j = n - 1
     for i in range(n):
-        yi, xi = polygon[i]["lat"], polygon[i]["lng"]
-        yj, xj = polygon[j]["lat"], polygon[j]["lng"]
+        yi, xi = polygon[i].lat, polygon[i].lng
+        yj, xj = polygon[j].lat, polygon[j].lng
         if ((yi > lat) != (yj > lat)) and (lng < (xj - xi) * (lat - yi) / (yj - yi) + xi):
             inside = not inside
         j = i
     return inside
 
 
-# ---------- pre-filter -------------------------------------------------------
+# ---------- eligibility pre-filter -------------------------------------------
 
 
 def _eligible(
@@ -64,53 +86,69 @@ def _eligible(
     job: Job,
     settings: Settings,
     request_day: int,
-    inspector_state: str | None,
     job_state: str | None,
 ) -> bool:
-    """Return True if *inspector* may be assigned *job* at all."""
+    """Return True if inspector may be assigned job at all.
+
+    This runs before OR-Tools so the solver never even considers ineligible
+    pairs. All checks here mirror inspectorAvailableForJob() in optimizer.ts.
+    """
     if not inspector.active:
         return False
 
-    # locked inspector
+    # 1. Locked inspector — only the named inspector may take this job
     if job.locked_inspector and job.locked_inspector != inspector.name:
         return False
 
-    # capabilities
+    # 2. Block run rules — this inspector is explicitly blocked from this job
+    if inspector.name in job.blocked_inspectors:
+        return False
+
+    # 3. Capabilities
     if not set(job.required_capabilities).issubset(set(inspector.capabilities)):
         return False
 
-    # distance
+    # 4. Distance limit (haversine pre-filter — road distance checked via matrix)
     dist_km = haversine_m(inspector.home_lat, inspector.home_lng, job.lat, job.lng) / 1000
     if dist_km > settings.max_home_dist_km:
         return False
 
-    # exclusion zones
-    for zone in inspector.exclusion_zones:
-        poly = [{"lat": p.lat, "lng": p.lng} for p in zone]
-        if _point_in_polygon(job.lat, job.lng, poly):
-            return False
+    # 5. State filtering — inspector home state must match job state
+    job_st = job_state
+    insp_st = inspector.home_state
+    if insp_st and job_st and insp_st != job_st:
+        return False
 
-    # schedule blocks
+    # 6. Weekly schedule blocks
     job_minutes = _parse_time_minutes(job.time_slot)
     for block in inspector.schedule_blocks:
         if block.day == request_day:
-            if block.slot == "*":  # whole-day block
+            if block.slot == "*":           # whole day off
                 return False
-            block_minutes = _parse_time_minutes(block.slot)
-            if block_minutes == job_minutes:
+            if _parse_time_minutes(block.slot) == job_minutes:
                 return False
 
-    # state filtering
-    if inspector_state and job_state and inspector_state != job_state:
-        return False
+    # 7. Exclusion zones — ray-cast check
+    for zone in inspector.exclusion_zones:
+        if _point_in_polygon(job.lat, job.lng, zone):
+            return False
+
+    # 8. Property rules
+    for rule in inspector.property_rules:
+        if rule.type == "maxSqFt" and job.sq_ft is not None:
+            if job.sq_ft > rule.value:
+                return False
+        elif rule.type == "minYearBuilt" and job.year_built is not None:
+            if job.year_built < rule.value:
+                return False
+        elif rule.type == "maxYearBuilt" and job.year_built is not None:
+            if job.year_built > rule.value:
+                return False
 
     return True
 
 
 # ---------- solver -----------------------------------------------------------
-
-_TIME_BUFFER_MIN = 30  # ± buffer around time slot
-_SERVICE_TIME_MIN = 60  # assumed on-site duration
 
 
 def optimize(request: OptimizeRequest) -> OptimizeResponse:
@@ -134,27 +172,16 @@ def optimize(request: OptimizeRequest) -> OptimizeResponse:
             },
         )
 
-    # Pre-compute inspector home states (use first job address as proxy for
-    # state detection — inspectors don't carry addresses themselves, so we
-    # infer state from proximity to job states).
-    # Actually, state filtering means: parse state from job address and only
-    # allow inspectors whose home is in the same state. We approximate the
-    # inspector's state from the nearest job or just use None (skip filter).
-    # The spec says "parse state from address" — jobs have addresses,
-    # inspectors don't. We'll derive inspector state from a reverse lookup
-    # or skip if we can't determine it.
-    inspector_states: list[str | None] = [None] * len(active_inspectors)
     job_states = [_parse_state(j.address) for j in jobs]
 
-    # Build eligibility matrix: inspector_idx -> set of eligible job indices
+    # Build eligibility matrix: vehicle_idx → set of eligible job indices
     eligible_map: dict[int, set[int]] = {v: set() for v in range(len(active_inspectors))}
     for v_idx, insp in enumerate(active_inspectors):
         for j_idx, job in enumerate(jobs):
-            if _eligible(insp, job, settings, request_day, inspector_states[v_idx], job_states[j_idx]):
+            if _eligible(insp, job, settings, request_day, job_states[j_idx]):
                 eligible_map[v_idx].add(j_idx)
 
-    # --- build coordinate list: depot per vehicle then jobs ----
-    # Nodes: 0..V-1 are depots (one per vehicle), V..V+J-1 are jobs
+    # Nodes: 0…V-1 = inspector homes (depots), V…V+J-1 = jobs
     num_vehicles = len(active_inspectors)
     num_jobs = len(jobs)
     num_nodes = num_vehicles + num_jobs
@@ -165,206 +192,187 @@ def optimize(request: OptimizeRequest) -> OptimizeResponse:
     for job in jobs:
         coords.append((job.lat, job.lng))
 
-    # Distance matrix
     dist_matrix = build_distance_matrix(
         coords, request.google_maps_key, road_factor=settings.road_factor
     )
 
-    # --- OR-Tools model --------------------------------------------------------
-    manager = pywrapcp.RoutingIndexManager(num_nodes, num_vehicles, list(range(num_vehicles)), list(range(num_vehicles)))
+    # ── OR-Tools model ────────────────────────────────────────────────────────
+    manager = pywrapcp.RoutingIndexManager(
+        num_nodes,
+        num_vehicles,
+        list(range(num_vehicles)),   # start nodes = each inspector's home
+        list(range(num_vehicles)),   # end nodes = same (return home)
+    )
     routing = pywrapcp.RoutingModel(manager)
 
-    # Distance callback
+    # ── Arc cost: distance + ranking penalty ──────────────────────────────────
+    # Ranking miles: for each inspector ranked below the best, add a flat arc-
+    # cost penalty = rank_delta * ranking_miles_m. This makes OR-Tools prefer
+    # higher-ranked inspectors when the distance difference is within the
+    # threshold — exactly mirroring the SA ranking tiebreaker logic.
+    ranking_m = int(settings.ranking_miles * 1609.34)   # miles → metres
+    sorted_ranks = sorted(set(i.rank for i in active_inspectors))
+    rank_index = {r: idx for idx, r in enumerate(sorted_ranks)}  # 0 = best rank
+
+    def _make_distance_cb(v_idx: int):
+        rank_pos = rank_index.get(active_inspectors[v_idx].rank, 0)
+        penalty_per_arc = rank_pos * ranking_m
+
+        def cb(from_index: int, to_index: int) -> int:
+            from_node = manager.IndexToNode(from_index)
+            to_node = manager.IndexToNode(to_index)
+            base = dist_matrix[from_node][to_node]
+            # Add ranking penalty on job arcs only (not depot→depot)
+            if to_node >= num_vehicles:
+                return base + penalty_per_arc
+            return base
+        return cb
+
+    # Register per-vehicle cost evaluators
+    for v_idx in range(num_vehicles):
+        cb = _make_distance_cb(v_idx)
+        cb_idx = routing.RegisterTransitCallback(cb)
+        routing.SetArcCostEvaluatorOfVehicle(cb_idx, v_idx)
+
+    # Pure distance callback (no penalty) for the Distance dimension
     def distance_callback(from_index: int, to_index: int) -> int:
-        from_node = manager.IndexToNode(from_index)
-        to_node = manager.IndexToNode(to_index)
-        return dist_matrix[from_node][to_node]
+        return dist_matrix[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)]
 
-    transit_cb_index = routing.RegisterTransitCallback(distance_callback)
-    routing.SetArcCostEvaluatorOfAllVehicles(transit_cb_index)
+    dist_cb_idx = routing.RegisterTransitCallback(distance_callback)
+    routing.AddDimension(dist_cb_idx, 0, 10_000_000, True, "Distance")
 
-    # Distance dimension (for tracking cumulative distance)
-    max_dist = 10_000_000  # 10 000 km in metres
-    routing.AddDimension(transit_cb_index, 0, max_dist, True, "Distance")
-
-    # --- Time dimension -------------------------------------------------------
-    # Convert distances to approximate travel time in minutes (assume 60 km/h avg)
+    # ── Time dimension ────────────────────────────────────────────────────────
     def time_callback(from_index: int, to_index: int) -> int:
-        from_node = manager.IndexToNode(from_index)
-        to_node = manager.IndexToNode(to_index)
-        dist_m = dist_matrix[from_node][to_node]
-        travel_min = int(dist_m / 1000)  # ~1 min per km at 60 km/h
-        return travel_min + _SERVICE_TIME_MIN  # travel + service
+        dist_m = dist_matrix[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)]
+        return int(dist_m / 1000) + _SERVICE_TIME_MIN   # 1 min/km + service
 
-    time_cb_index = routing.RegisterTransitCallback(time_callback)
-    day_start = 0
-    day_end = 24 * 60  # minutes in a day
-    routing.AddDimension(time_cb_index, day_end, day_end, False, "Time")
-    time_dimension = routing.GetDimensionOrDie("Time")
+    time_cb_idx = routing.RegisterTransitCallback(time_callback)
+    day_end = 24 * 60
+    routing.AddDimension(time_cb_idx, day_end, day_end, False, "Time")
+    time_dim = routing.GetDimensionOrDie("Time")
 
-    # Set time windows for job nodes
     third_job_min = _parse_time_minutes(settings.third_job_min_time)
 
     for j_idx, job in enumerate(jobs):
-        node = num_vehicles + j_idx  # job node index
-        index = manager.NodeToIndex(node)
-        slot_min = _parse_time_minutes(job.time_slot)
-        tw_start = max(day_start, slot_min - _TIME_BUFFER_MIN)
-        tw_end = min(day_end, slot_min + _TIME_BUFFER_MIN)
-        time_dimension.CumulVar(index).SetRange(tw_start, tw_end)
-
-    # Depot time windows (full day)
+        index = manager.NodeToIndex(num_vehicles + j_idx)
+        slot = _parse_time_minutes(job.time_slot)
+        time_dim.CumulVar(index).SetRange(
+            max(0, slot - _TIME_BUFFER_MIN),
+            min(day_end, slot + _TIME_BUFFER_MIN),
+        )
     for v in range(num_vehicles):
-        start_index = routing.Start(v)
-        end_index = routing.End(v)
-        time_dimension.CumulVar(start_index).SetRange(day_start, day_end)
-        time_dimension.CumulVar(end_index).SetRange(day_start, day_end)
+        time_dim.CumulVar(routing.Start(v)).SetRange(0, day_end)
+        time_dim.CumulVar(routing.End(v)).SetRange(0, day_end)
 
-    # --- Capacity dimension (max jobs per inspector) --------------------------
-    def demand_callback(from_index: int) -> int:
-        node = manager.IndexToNode(from_index)
-        if node < num_vehicles:
-            return 0  # depot
-        return 1
+    # ── Capacity: max jobs per inspector ──────────────────────────────────────
+    def demand_cb(from_index: int) -> int:
+        return 0 if manager.IndexToNode(from_index) < num_vehicles else 1
 
-    demand_cb_index = routing.RegisterUnaryTransitCallback(demand_callback)
-    vehicle_capacities = [insp.max_jobs for insp in active_inspectors]
-    routing.AddDimensionWithVehicleCapacity(demand_cb_index, 0, vehicle_capacities, True, "Capacity")
+    demand_cb_idx = routing.RegisterUnaryTransitCallback(demand_cb)
+    routing.AddDimensionWithVehicleCapacity(
+        demand_cb_idx, 0,
+        [insp.max_jobs for insp in active_inspectors],
+        True, "Capacity",
+    )
 
-    # --- Eligibility: disallow ineligible (inspector, job) pairs ---------------
-    for v_idx in range(num_vehicles):
-        for j_idx in range(num_jobs):
-            if j_idx not in eligible_map[v_idx]:
-                node = num_vehicles + j_idx
-                index = manager.NodeToIndex(node)
-                routing.VehicleVar(index).RemoveValue(v_idx)
-
-    # --- Locked inspector constraint ------------------------------------------
-    for j_idx, job in enumerate(jobs):
-        if job.locked_inspector:
-            target_v = None
-            for v_idx, insp in enumerate(active_inspectors):
-                if insp.name == job.locked_inspector:
-                    target_v = v_idx
-                    break
-            if target_v is not None:
-                node = num_vehicles + j_idx
-                index = manager.NodeToIndex(node)
-                routing.VehicleVar(index).SetValue(target_v)
-
-    # --- Third-job time enforcement -------------------------------------------
-    # We enforce via a custom dimension that the 3rd+ job must start >= third_job_min_time.
-    # OR-Tools doesn't directly support conditional capacity, so we use a disjunction
-    # penalty approach + post-solve validation. For simplicity we limit capacity to 2
-    # for jobs before third_job_min_time and allow full capacity otherwise.
-    # Actually, we handle this by tightening constraints: for each vehicle, if a job
-    # time_slot < third_job_min_time, we cap capacity dimension to 2 using solver
-    # constraints after building the model isn't straightforward.
-    #
-    # Simpler approach: we already have max_jobs capacity. The "3rd job only if >= 11:30"
-    # rule means: an inspector can take at most 2 jobs whose time_slot < third_job_min_time.
-    # We'll add a second capacity dimension counting "early" jobs.
-
-    def early_demand_callback(from_index: int) -> int:
+    # ── EarlyCapacity: max 2 jobs before third_job_min_time ──────────────────
+    def early_demand_cb(from_index: int) -> int:
         node = manager.IndexToNode(from_index)
         if node < num_vehicles:
             return 0
-        j_idx = node - num_vehicles
-        slot = _parse_time_minutes(jobs[j_idx].time_slot)
-        return 1 if slot < third_job_min else 0
+        return 1 if _parse_time_minutes(jobs[node - num_vehicles].time_slot) < third_job_min else 0
 
-    early_cb_index = routing.RegisterUnaryTransitCallback(early_demand_callback)
-    early_caps = [2] * num_vehicles  # max 2 early jobs per inspector
-    routing.AddDimensionWithVehicleCapacity(early_cb_index, 0, early_caps, True, "EarlyCapacity")
+    early_cb_idx = routing.RegisterUnaryTransitCallback(early_demand_cb)
+    routing.AddDimensionWithVehicleCapacity(
+        early_cb_idx, 0,
+        [2] * num_vehicles,
+        True, "EarlyCapacity",
+    )
 
-    # --- Time-slot uniqueness per inspector -----------------------------------
-    # "No two jobs at same time slot per inspector" — handled implicitly by time
-    # windows: two jobs with identical time_slot have overlapping windows, but
-    # the service time (60 min) + travel means the solver can't schedule both
-    # within the ±30-min window. This naturally prevents duplicates.
+    # ── Eligibility: RemoveValue for every ineligible (inspector, job) pair ──
+    for v_idx in range(num_vehicles):
+        for j_idx in range(num_jobs):
+            if j_idx not in eligible_map[v_idx]:
+                routing.VehicleVar(manager.NodeToIndex(num_vehicles + j_idx)).RemoveValue(v_idx)
 
-    # --- Hard constraint: no two same-slot jobs on the same vehicle -----------
-    # Group job indices by time_slot. For each group, every pair of jobs must
-    # be on *different* vehicles. This is the correct OR-Tools way to prevent
-    # double-booking before the solver runs — no post-processing needed.
-    from collections import defaultdict
+    # ── Locked inspector: SetValue forces assignment ──────────────────────────
+    for j_idx, job in enumerate(jobs):
+        if job.locked_inspector:
+            for v_idx, insp in enumerate(active_inspectors):
+                if insp.name == job.locked_inspector:
+                    routing.VehicleVar(manager.NodeToIndex(num_vehicles + j_idx)).SetValue(v_idx)
+                    break
+
+    # ── Same-slot uniqueness: VehicleVar(a) != VehicleVar(b) ─────────────────
     slot_groups: dict[str, list[int]] = defaultdict(list)
     for j_idx, job in enumerate(jobs):
         if job.time_slot:
             slot_groups[job.time_slot].append(j_idx)
 
     solver = routing.solver()
-    for slot, group in slot_groups.items():
+    for group in slot_groups.values():
         for i in range(len(group)):
             for k in range(i + 1, len(group)):
                 idx_a = manager.NodeToIndex(num_vehicles + group[i])
                 idx_b = manager.NodeToIndex(num_vehicles + group[k])
-                # Force different vehicles (or at least one dropped)
-                solver.Add(
-                    routing.VehicleVar(idx_a) != routing.VehicleVar(idx_b)
-                )
+                solver.Add(routing.VehicleVar(idx_a) != routing.VehicleVar(idx_b))
 
-    # --- Allow dropping jobs (penalty for unassigned) -------------------------
+    # ── Disjunction: jobs may be dropped with heavy penalty ──────────────────
     penalty = 100_000_000
     for j_idx in range(num_jobs):
-        node = num_vehicles + j_idx
-        routing.AddDisjunction([manager.NodeToIndex(node)], penalty)
+        routing.AddDisjunction([manager.NodeToIndex(num_vehicles + j_idx)], penalty)
 
-    # --- Solve ----------------------------------------------------------------
+    # ── Solve ─────────────────────────────────────────────────────────────────
     search_params = pywrapcp.DefaultRoutingSearchParameters()
     search_params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
     search_params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
     search_params.time_limit.seconds = 10
-
     solution = routing.SolveWithParameters(search_params)
 
-    # --- Extract solution -----------------------------------------------------
+    # ── Extract solution ──────────────────────────────────────────────────────
     assignments: dict[str, list[str]] = {insp.name: [] for insp in active_inspectors}
     per_inspector: dict[str, InspectorResult] = {}
     total_distance = 0
-    assigned_job_ids: set[str] = set()
+    assigned_ids: set[str] = set()
 
     if solution:
         for v_idx, insp in enumerate(active_inspectors):
             route_jobs: list[str] = []
             route_order: list[str] = ["home"]
-            route_distance = 0
+            route_dist = 0
             index = routing.Start(v_idx)
-            prev_index = index
             while not routing.IsEnd(index):
                 node = manager.IndexToNode(index)
                 if node >= num_vehicles:
-                    j_idx = node - num_vehicles
-                    route_jobs.append(jobs[j_idx].id)
-                    route_order.append(jobs[j_idx].id)
-                    assigned_job_ids.add(jobs[j_idx].id)
+                    jid = jobs[node - num_vehicles].id
+                    route_jobs.append(jid)
+                    route_order.append(jid)
+                    assigned_ids.add(jid)
                 next_index = solution.Value(routing.NextVar(index))
-                route_distance += routing.GetArcCostForVehicle(index, next_index, v_idx)
-                prev_index = index
+                route_dist += dist_matrix[manager.IndexToNode(index)][manager.IndexToNode(next_index)]
                 index = next_index
             route_order.append("home")
             assignments[insp.name] = route_jobs
             per_inspector[insp.name] = InspectorResult(
-                distance_m=route_distance, jobs=route_jobs, route_order=route_order
+                distance_m=route_dist, jobs=route_jobs, route_order=route_order
             )
-            total_distance += route_distance
+            total_distance += route_dist
     else:
         for insp in active_inspectors:
             per_inspector[insp.name] = InspectorResult(distance_m=0, jobs=[], route_order=[])
 
-    unassigned = [j.id for j in jobs if j.id not in assigned_job_ids]
+    unassigned = [j.id for j in jobs if j.id not in assigned_ids]
 
-    # --- Compute naive baseline (each job round-trip from nearest eligible inspector) ---
+    # ── Baseline: naive round-trip from nearest eligible inspector ────────────
     original_distance = 0
     for j_idx, job in enumerate(jobs):
-        best = None
+        best: int | None = None
         job_node = num_vehicles + j_idx
         for v_idx in range(num_vehicles):
             if j_idx in eligible_map[v_idx]:
-                depot_node = v_idx
-                round_trip = dist_matrix[depot_node][job_node] + dist_matrix[job_node][depot_node]
-                if best is None or round_trip < best:
-                    best = round_trip
+                rt = dist_matrix[v_idx][job_node] + dist_matrix[job_node][v_idx]
+                if best is None or rt < best:
+                    best = rt
         if best is not None:
             original_distance += best
 
@@ -374,8 +382,8 @@ def optimize(request: OptimizeRequest) -> OptimizeResponse:
 
     return OptimizeResponse(
         assignments=assignments,
-        total_distance_m=total_distance,
-        original_distance_m=original_distance,
+        total_distance_m=float(total_distance),
+        original_distance_m=float(original_distance),
         savings_pct=max(savings_pct, 0.0),
         unassigned=unassigned,
         per_inspector=per_inspector,
