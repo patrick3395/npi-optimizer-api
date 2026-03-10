@@ -5,12 +5,14 @@ from __future__ import annotations
 import os
 
 from flask import Flask, jsonify, request
+from flask_cors import CORS
 from pydantic import ValidationError
 
 from models import OptimizeRequest
 from optimizer import optimize
 
 app = Flask(__name__)
+CORS(app)
 
 
 @app.route("/optimize", methods=["POST"])
