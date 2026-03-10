@@ -283,6 +283,27 @@ def optimize(request: OptimizeRequest) -> OptimizeResponse:
     # the service time (60 min) + travel means the solver can't schedule both
     # within the ±30-min window. This naturally prevents duplicates.
 
+    # --- Hard constraint: no two same-slot jobs on the same vehicle -----------
+    # Group job indices by time_slot. For each group, every pair of jobs must
+    # be on *different* vehicles. This is the correct OR-Tools way to prevent
+    # double-booking before the solver runs — no post-processing needed.
+    from collections import defaultdict
+    slot_groups: dict[str, list[int]] = defaultdict(list)
+    for j_idx, job in enumerate(jobs):
+        if job.time_slot:
+            slot_groups[job.time_slot].append(j_idx)
+
+    solver = routing.solver()
+    for slot, group in slot_groups.items():
+        for i in range(len(group)):
+            for k in range(i + 1, len(group)):
+                idx_a = manager.NodeToIndex(num_vehicles + group[i])
+                idx_b = manager.NodeToIndex(num_vehicles + group[k])
+                # Force different vehicles (or at least one dropped)
+                solver.Add(
+                    routing.VehicleVar(idx_a) != routing.VehicleVar(idx_b)
+                )
+
     # --- Allow dropping jobs (penalty for unassigned) -------------------------
     penalty = 100_000_000
     for j_idx in range(num_jobs):
@@ -331,48 +352,7 @@ def optimize(request: OptimizeRequest) -> OptimizeResponse:
         for insp in active_inspectors:
             per_inspector[insp.name] = InspectorResult(distance_m=0, jobs=[], route_order=[])
 
-    # --- Post-process: enforce one job per time slot per inspector ------------
-    # OR-Tools time windows can be bypassed by slack; do a hard dedup pass.
-    job_by_id: dict[str, "Job"] = {j.id: j for j in jobs}
-    dedup_unassigned: list[str] = []
-    for insp_name, job_ids in assignments.items():
-        insp = next((i for i in active_inspectors if i.name == insp_name), None)
-        seen_slots: dict[str, str] = {}  # slot → job_id we're keeping
-        keep: list[str] = []
-        for jid in job_ids:
-            job = job_by_id.get(jid)
-            slot = job.time_slot if job else ""
-            if slot and slot in seen_slots:
-                # Duplicate slot — keep the closer one
-                existing_jid = seen_slots[slot]
-                existing_job = job_by_id[existing_jid]
-                if insp:
-                    dist_new = haversine_m(insp.home_lat, insp.home_lng, job.lat, job.lng)
-                    dist_old = haversine_m(insp.home_lat, insp.home_lng, existing_job.lat, existing_job.lng)
-                    if dist_new < dist_old:
-                        # swap: drop existing, keep new
-                        keep.remove(existing_jid)
-                        keep.append(jid)
-                        seen_slots[slot] = jid
-                        dedup_unassigned.append(existing_jid)
-                        assigned_job_ids.discard(existing_jid)
-                    else:
-                        dedup_unassigned.append(jid)
-                        assigned_job_ids.discard(jid)
-                else:
-                    dedup_unassigned.append(jid)
-                    assigned_job_ids.discard(jid)
-            else:
-                seen_slots[slot] = jid
-                keep.append(jid)
-        assignments[insp_name] = keep
-        if insp_name in per_inspector:
-            per_inspector[insp_name].jobs = keep
-            per_inspector[insp_name].route_order = (
-                ["home"] + keep + ["home"]
-            )
-
-    unassigned = [j.id for j in jobs if j.id not in assigned_job_ids] + dedup_unassigned
+    unassigned = [j.id for j in jobs if j.id not in assigned_job_ids]
 
     # --- Compute naive baseline (each job round-trip from nearest eligible inspector) ---
     original_distance = 0
