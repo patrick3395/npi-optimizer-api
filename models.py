@@ -1,65 +1,38 @@
-"""Pydantic data models for the NPI Route Optimizer API."""
+"""Pydantic data models for the NPI Route Optimizer API — v2.
+
+Payload shape (from frontend):
+  - eligible_inspectors[] pre-computed per job — all constraint logic runs on frontend
+  - No API keys, no capabilities, no schedules, no exclusion zones
+  - Cloud Run does pure distance-based global assignment optimization
+"""
 
 from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
 
-class ScheduleBlock(BaseModel):
-    day: int  # 0=Sun, 1=Mon … 6=Sat (JS getDay convention)
-    slot: str  # "8:30 AM" or "*" for whole-day block
-
-
-class LatLng(BaseModel):
-    lat: float
-    lng: float
-
-
-class PropertyRule(BaseModel):
-    type: str   # "maxSqFt" | "minYearBuilt" | "maxYearBuilt"
-    value: float
-
-
 class Inspector(BaseModel):
     name: str
     home_lat: float
     home_lng: float
-    home_state: str | None = None          # 2-letter state code, e.g. "TX"
-    rank: int = 999                        # lower number = higher priority
-    capabilities: list[str] = Field(default_factory=list)
-    schedule_blocks: list[ScheduleBlock] = Field(default_factory=list)
-    exclusion_zones: list[list[LatLng]] = Field(default_factory=list)
-    property_rules: list[PropertyRule] = Field(default_factory=list)
-    max_jobs: int = 3
-    active: bool = True
+    max_jobs: int = 2       # hard cap — frontend sets per-inspector value
+    rank: int = 999         # lower = higher priority (used for tie-breaking)
 
 
 class Job(BaseModel):
     id: str
-    address: str
     lat: float
     lng: float
-    time_slot: str
-    required_capabilities: list[str] = Field(default_factory=list)
-    locked_inspector: str | None = None
-    blocked_inspectors: list[str] = Field(default_factory=list)  # block_inspector_job / _city run rules
-    sq_ft: float | None = None
-    year_built: int | None = None
-
-
-class Settings(BaseModel):
-    max_home_dist_km: float = 200
-    third_job_min_time: str = "11:30 AM"
-    road_factor: float = 1.35
-    ranking_miles: float = 0               # max miles to concede for a higher-ranked inspector
+    time_minutes: int | None = None         # minutes since midnight, None = no scheduled time
+    duration_hours: float = 2.5
+    eligible_inspectors: list[str]          # pre-filtered by frontend — only valid candidates
+    locked_inspector: str | None = None     # must be assigned to this inspector
 
 
 class OptimizeRequest(BaseModel):
     date: str
-    google_maps_key: str
     inspectors: list[Inspector]
     jobs: list[Job]
-    settings: Settings = Field(default_factory=Settings)
 
 
 class InspectorResult(BaseModel):
