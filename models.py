@@ -33,6 +33,10 @@ class OptimizeRequest(BaseModel):
     date: str
     inspectors: list[Inspector]
     jobs: list[Job]
+    # Optional pre-computed distance matrix (metres, integer) from Google Maps.
+    # Nodes ordered as: [inspector homes..., jobs...] — same as build_distance_matrix coords.
+    # If omitted, backend falls back to Haversine × 1.35.
+    distance_matrix: list[list[int]] | None = None
 
 
 class InspectorResult(BaseModel):

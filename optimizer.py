@@ -51,7 +51,13 @@ def optimize(request: OptimizeRequest) -> OptimizeResponse:
         [(i.home_lat, i.home_lng) for i in inspectors] +
         [(j.lat, j.lng) for j in jobs]
     )
-    dist_matrix = build_distance_matrix(coords)
+    # Use Google Maps distance matrix if provided by frontend, else Haversine × 1.35
+    if request.distance_matrix and len(request.distance_matrix) == len(coords):
+        dist_matrix = request.distance_matrix
+        print(f"[optimizer] Using Google Maps distance matrix ({len(coords)}×{len(coords)})")
+    else:
+        dist_matrix = build_distance_matrix(coords)
+        print(f"[optimizer] Using Haversine distance matrix ({len(coords)}×{len(coords)})")
 
     # ── OR-Tools model ────────────────────────────────────────────────────────
     manager = pywrapcp.RoutingIndexManager(
