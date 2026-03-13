@@ -73,7 +73,7 @@ def optimize(request: OptimizeRequest) -> OptimizeResponse:
     rank_pos = {r: idx for idx, r in enumerate(sorted_ranks)}
 
     def _make_cost_cb(v: int):
-        penalty = rank_pos.get(inspectors[v].rank, 0) * 500  # 500m per rank step
+        penalty = rank_pos.get(inspectors[v].rank, 0) * 25   # 25m per rank step (tie-breaking only)
         def cb(from_idx: int, to_idx: int) -> int:
             base = dist_matrix[manager.IndexToNode(from_idx)][manager.IndexToNode(to_idx)]
             return base + penalty if manager.IndexToNode(to_idx) >= num_vehicles else base
