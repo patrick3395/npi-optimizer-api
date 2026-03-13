@@ -68,20 +68,12 @@ def optimize(request: OptimizeRequest) -> OptimizeResponse:
     )
     routing = pywrapcp.RoutingModel(manager)
 
-    # ── Arc cost: distance + small rank penalty for tie-breaking ─────────────
-    sorted_ranks = sorted(set(i.rank for i in inspectors))
-    rank_pos = {r: idx for idx, r in enumerate(sorted_ranks)}
+    # ── Arc cost: pure distance — rank/change-miles are post-optimization filters on the frontend ──
+    def dist_cb(from_idx: int, to_idx: int) -> int:
+        return dist_matrix[manager.IndexToNode(from_idx)][manager.IndexToNode(to_idx)]
 
-    def _make_cost_cb(v: int):
-        penalty = rank_pos.get(inspectors[v].rank, 0) * 25   # 25m per rank step (tie-breaking only)
-        def cb(from_idx: int, to_idx: int) -> int:
-            base = dist_matrix[manager.IndexToNode(from_idx)][manager.IndexToNode(to_idx)]
-            return base + penalty if manager.IndexToNode(to_idx) >= num_vehicles else base
-        return cb
-
-    for v in range(num_vehicles):
-        cb_idx = routing.RegisterTransitCallback(_make_cost_cb(v))
-        routing.SetArcCostEvaluatorOfVehicle(cb_idx, v)
+    dist_cb_idx = routing.RegisterTransitCallback(dist_cb)
+    routing.SetArcCostEvaluatorOfAllVehicles(dist_cb_idx)
 
     # ── Capacity: max jobs per inspector ──────────────────────────────────────
     def demand_cb(from_idx: int) -> int:
