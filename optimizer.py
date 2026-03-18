@@ -1,28 +1,30 @@
-"""OR-Tools VRPTW optimizer for NPI Route Optimizer — v2.
+"""OR-Tools VRPTW optimizer for NPI Route Optimizer — v3.
 
 Architecture:
   Frontend pre-computes eligible_inspectors[] per job (all constraint checks).
-  This solver only needs to assign jobs to eligible inspectors minimizing total drive distance.
+  This solver assigns jobs to eligible inspectors minimizing total drive distance.
 
 OR-Tools constraints:
   1. Eligibility    — VehicleVar restricted to eligible_inspectors[] per job
   2. Locked         — locked_inspector forces VehicleVar to single vehicle
   3. Max jobs       — per-inspector capacity dimension
-  4. Time conflicts — same time_minutes → different inspectors (no double-booking)
+  4. Time windows   — appointment time + duration_hours prevents overlapping jobs
   5. Disjunction    — jobs may be dropped with heavy penalty (prevents infeasible)
+
+v3 changes:
+  - Duration-based scheduling: uses job.duration_hours instead of hardcoded 150 min
+  - Overlap prevention via time dimension (not just exact-match time_minutes)
+  - Removed _SERVICE_MIN constant
 """
 
 from __future__ import annotations
-
-from collections import defaultdict
 
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 
 from geocoder import build_distance_matrix
 from models import InspectorResult, Job, OptimizeRequest, OptimizeResponse
 
-_TIME_BUFFER_MIN = 45   # ± window around appointment time for time dimension
-_SERVICE_MIN = 150      # default on-site time in minutes (2.5 hrs)
+_TRAVEL_SPEED_KM_PER_MIN = 1.0  # ~60 km/h average
 
 
 def optimize(request: OptimizeRequest) -> OptimizeResponse:
@@ -59,6 +61,11 @@ def optimize(request: OptimizeRequest) -> OptimizeResponse:
         dist_matrix = build_distance_matrix(coords)
         print(f"[optimizer] Using Haversine distance matrix ({len(coords)}×{len(coords)})")
 
+    # ── Per-job service time (minutes) ────────────────────────────────────────
+    job_service_min: list[int] = [
+        int(round(j.duration_hours * 60)) for j in jobs
+    ]
+
     # ── OR-Tools model ────────────────────────────────────────────────────────
     manager = pywrapcp.RoutingIndexManager(
         num_nodes,
@@ -68,7 +75,7 @@ def optimize(request: OptimizeRequest) -> OptimizeResponse:
     )
     routing = pywrapcp.RoutingModel(manager)
 
-    # ── Arc cost: pure distance — rank/change-miles are post-optimization filters on the frontend ──
+    # ── Arc cost: pure distance ───────────────────────────────────────────────
     def dist_cb(from_idx: int, to_idx: int) -> int:
         return dist_matrix[manager.IndexToNode(from_idx)][manager.IndexToNode(to_idx)]
 
@@ -86,26 +93,45 @@ def optimize(request: OptimizeRequest) -> OptimizeResponse:
         True, "Capacity",
     )
 
-    # ── Time dimension ────────────────────────────────────────────────────────
+    # ── Time dimension: travel time + service time (duration_hours) ───────────
+    # Transit = travel time (distance / speed) + service time at the FROM node.
+    # Service time at home nodes (inspector depots) is 0.
+    # Service time at job nodes is the job's duration in minutes.
     def time_cb(from_idx: int, to_idx: int) -> int:
-        dist_m = dist_matrix[manager.IndexToNode(from_idx)][manager.IndexToNode(to_idx)]
-        return int(dist_m / 1000) + _SERVICE_MIN  # 1 min/km travel + service time
+        from_node = manager.IndexToNode(from_idx)
+        to_node = manager.IndexToNode(to_idx)
+        # Travel time: distance in metres → km → minutes at travel speed
+        travel_min = int(dist_matrix[from_node][to_node] / 1000 / _TRAVEL_SPEED_KM_PER_MIN)
+        # Service time at the FROM node (only for job nodes, not depots)
+        service = 0
+        if from_node >= num_vehicles:
+            service = job_service_min[from_node - num_vehicles]
+        return travel_min + service
 
     time_cb_idx = routing.RegisterTransitCallback(time_cb)
-    day_end = 24 * 60
+    day_start = 0
+    day_end = 24 * 60  # 1440 minutes
     routing.AddDimension(time_cb_idx, day_end, day_end, False, "Time")
     time_dim = routing.GetDimensionOrDie("Time")
 
+    # ── Time windows: each job must be visited at its appointment time ────────
+    # The cumul var represents ARRIVAL time at the node.
+    # Setting [time_minutes, time_minutes] forces arrival at the exact appointment.
+    # Jobs without a time get the full day window.
     for j_idx, job in enumerate(jobs):
+        node_idx = manager.NodeToIndex(num_vehicles + j_idx)
         if job.time_minutes is not None:
-            node_idx = manager.NodeToIndex(num_vehicles + j_idx)
-            lo = max(0, job.time_minutes - _TIME_BUFFER_MIN)
-            hi = min(day_end, job.time_minutes + _TIME_BUFFER_MIN)
+            # Fixed appointment time — arrive at this exact minute
+            lo = max(day_start, job.time_minutes)
+            hi = min(day_end, job.time_minutes)
             time_dim.CumulVar(node_idx).SetRange(lo, hi)
+        else:
+            time_dim.CumulVar(node_idx).SetRange(day_start, day_end)
 
+    # Inspector start/end windows: full day
     for v in range(num_vehicles):
-        time_dim.CumulVar(routing.Start(v)).SetRange(0, day_end)
-        time_dim.CumulVar(routing.End(v)).SetRange(0, day_end)
+        time_dim.CumulVar(routing.Start(v)).SetRange(day_start, day_end)
+        time_dim.CumulVar(routing.End(v)).SetRange(day_start, day_end)
 
     # ── Eligibility: restrict VehicleVar to eligible_inspectors only ──────────
     for j_idx, job in enumerate(jobs):
@@ -120,20 +146,6 @@ def optimize(request: OptimizeRequest) -> OptimizeResponse:
         if job.locked_inspector and job.locked_inspector in insp_idx:
             v = insp_idx[job.locked_inspector]
             routing.VehicleVar(manager.NodeToIndex(num_vehicles + j_idx)).SetValue(v)
-
-    # ── No double-booking: same time_minutes → different inspectors ───────────
-    time_groups: dict[int, list[int]] = defaultdict(list)
-    for j_idx, job in enumerate(jobs):
-        if job.time_minutes is not None:
-            time_groups[job.time_minutes].append(j_idx)
-
-    solver = routing.solver()
-    for group in time_groups.values():
-        for a in range(len(group)):
-            for b in range(a + 1, len(group)):
-                idx_a = manager.NodeToIndex(num_vehicles + group[a])
-                idx_b = manager.NodeToIndex(num_vehicles + group[b])
-                solver.Add(routing.VehicleVar(idx_a) != routing.VehicleVar(idx_b))
 
     # ── Disjunction: allow dropping jobs with heavy penalty ───────────────────
     penalty = 100_000_000
